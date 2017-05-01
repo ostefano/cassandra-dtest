@@ -906,6 +906,421 @@ class TestMaterializedViews(Tester):
                 cl=ConsistencyLevel.ALL
             )
 
+    @since('4.0')
+    def test_base_column_in_view_pk_complex_timestamp_with_flush(self):
+        self._test_base_column_in_view_pk_complex_timestamp(flush=True)
+
+    @since('4.0')
+    def test_base_column_in_view_pk_complex_timestamp_without_flush(self):
+        self._test_base_column_in_view_pk_complex_timestamp(flush=False)
+
+    def _test_base_column_in_view_pk_complex_timestamp(self, flush):
+        """
+        Able to shadow old view row with column ts greater than pk's ts and re-insert the view row
+
+        @jira_ticket CASSANDRA-11500
+        """
+        session = self.prepare(rf=3, nodes=3, options={'hinted_handoff_enabled': False}, consistency_level=ConsistencyLevel.QUORUM)
+        node1 = self.cluster.nodelist()[0]
+
+        session.execute('USE ks')
+        session.execute("CREATE TABLE t (k int PRIMARY KEY, a int, b int)")
+        session.execute(("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t "
+                         "WHERE k IS NOT NULL AND a IS NOT NULL PRIMARY KEY (k, a)"))
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        # Set initial values TS=1
+        session.execute(SimpleStatement("INSERT INTO t (k, a, b) VALUES (1, 1, 1) USING TIMESTAMP 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT * FROM t", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv", [1, 1, 1])
+
+        # increase b ts to 10
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 10 SET b = 2 WHERE k = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 1, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 1, 2, 10])
+
+        # switch entries. shadow a = 1, insert a = 2
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 2 SET a = 2 WHERE k = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 2, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 2, 2, 10])
+
+        # switch entries. shadow a = 2, insert a = 1
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 3 SET a = 1 WHERE k = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 1, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 1, 2, 10])
+
+        # switch entries. shadow a = 1, insert a = 2
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 4 SET a = 2 WHERE k = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+            self.cluster.compact()
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 2, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 2, 2, 10])
+
+    @since('4.0')
+    def test_base_column_in_view_pk_with_flush(self):
+        self._test_base_column_in_view_pk(flush=True)
+
+    @since('4.0')
+    def test_base_column_in_view_pk_without_flush(self):
+        self._test_base_column_in_view_pk(flush=False)
+
+    def _test_base_column_in_view_pk(self, flush):
+        """
+        view row deletion should be commutative with newer view livenessInfo, otherwise deleted columns may be resurrected.
+
+        @jira_ticket CASSANDRA-13409
+        """
+        session = self.prepare(rf=3, nodes=3, options={'hinted_handoff_enabled': False}, consistency_level=ConsistencyLevel.QUORUM)
+        node1 = self.cluster.nodelist()[0]
+
+        session.execute('USE ks')
+        session.execute("CREATE TABLE t (id int PRIMARY KEY, v int, v2 text, v3 decimal)")
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
+                         "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v,id)"))
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        # Set initial values TS=1
+        session.execute(SimpleStatement("INSERT INTO t (id, v, v2, v3) VALUES (1, 1, 'a', 3.0) USING TIMESTAMP 1"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT * FROM t_by_v", [1, 1, 'a', 3.0])
+
+        # change v's value and TS=2, tombstones v=1 and adds v=0 record
+        session.execute(SimpleStatement("DELETE FROM t USING TIMESTAMP 2 WHERE id = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_none(session, "SELECT * FROM t_by_v")
+        assert_none(session, "SELECT * FROM t")
+
+        # tombstones of mv created by base deletion should remain.
+        session.execute(SimpleStatement("INSERT INTO t (id, v) VALUES (1, 1) USING TIMESTAMP 3"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+            self.cluster.compact()
+        assert_one(session, "SELECT * FROM t_by_v", [1, 1, None, None])
+        assert_one(session, "SELECT * FROM t", [1, 1, None, None])
+
+        # delete view row (id=1, v=1), insert (id=1, v=2, ts=4)
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 4 set v = 2 WHERE id = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT * FROM t_by_v", [2, 1, None, None])
+        assert_one(session, "SELECT * FROM t", [1, 2, None, None])
+
+        # delete view row (id=1, v=2), insert (id=1, v=1 ts=5)
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 5 set v = 1 WHERE id = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT * FROM t_by_v", [1, 1, None, None])
+        assert_one(session, "SELECT * FROM t", [1, 1, None, None])
+
+        # delete view row (id=1, v=1)
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 5 set v = null WHERE id = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_none(session, "SELECT * FROM t_by_v")
+        assert_one(session, "SELECT * FROM t", [1, None, None, None])
+
+    @since('4.0')
+    def test_base_column_filtered_in_view_with_flush(self):
+        self._test_base_column_filtered_in_view(flush=True)
+
+    @since('4.0')
+    def test_base_column_filtered_in_view_without_flush(self):
+        self._test_base_column_filtered_in_view(flush=False)
+
+    def _test_base_column_filtered_in_view(self, flush):
+        """
+        filtered base table column cannot be dropped. if filtered column doesn't match condition, view row is considered dead.
+
+        @jira_ticket CASSANDRA-13547
+        @jira_ticket CASSANDRA-13657
+        """
+        session = self.prepare(rf=3, nodes=3, options={'hinted_handoff_enabled': False}, consistency_level=ConsistencyLevel.QUORUM)
+        node1 = self.cluster.nodelist()[0]
+
+        session.execute('USE ks')
+        session.execute("CREATE TABLE t (a int, b int, c int, d int, PRIMARY KEY (a))")
+        session.execute("CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM t WHERE a IS NOT NULL AND b IS NOT NULL and c = 1  PRIMARY KEY (a, b)")
+        session.execute("CREATE MATERIALIZED VIEW mv2 AS SELECT a, b FROM t WHERE a IS NOT NULL AND b IS NOT NULL and c = 1 and d = 1 PRIMARY KEY (a, b)")
+        session.execute("CREATE MATERIALIZED VIEW mv3 AS SELECT a, b, c FROM t WHERE a IS NOT NULL AND c = 1 PRIMARY KEY (a, c)")
+        session.execute("CREATE MATERIALIZED VIEW mv4 AS SELECT c FROM t WHERE a IS NOT NULL AND b IS NOT NULL and c = 1 PRIMARY KEY (a, b)")
+        session.execute("CREATE MATERIALIZED VIEW mv5 AS SELECT c FROM t WHERE a IS NOT NULL and d = 1 PRIMARY KEY (a, d)")
+        session.execute("CREATE MATERIALIZED VIEW mv6 AS SELECT c FROM t WHERE a = 1 and d IS NOT NULL PRIMARY KEY (a, d)")
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        # Set initial values TS=0, all conditions are matched
+        session.execute(SimpleStatement("INSERT INTO t (a, b, c, d) VALUES (1, 1, 1, 1) using timestamp 0"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT * FROM mv1", [1, 1, 1, 1])
+        assert_one(session, "SELECT * FROM mv2", [1, 1])
+        assert_one(session, "SELECT * FROM mv3", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv4", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv5", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv6", [1, 1, 1])
+        assert_one(session, "SELECT * FROM t", [1, 1, 1, 1])
+
+        # mv1,mv2,mv3,mv4 conditions failed
+        session.execute(SimpleStatement("UPDATE t using timestamp 1 set c = 0 WHERE a = 1"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_none(session, "SELECT * FROM mv1")
+        assert_none(session, "SELECT * FROM mv2")
+        assert_none(session, "SELECT * FROM mv3")
+        assert_none(session, "SELECT * FROM mv4")
+        assert_one(session, "SELECT * FROM mv5", [1, 1, 0])
+        assert_one(session, "SELECT * FROM mv6", [1, 1, 0])
+        assert_one(session, "SELECT * FROM t", [1, 1, 0, 1])
+
+        # all conditions matched
+        session.execute(SimpleStatement("UPDATE t using timestamp 2 set c = 1 WHERE a = 1"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+            self.cluster.compact()
+        assert_one(session, "SELECT * FROM mv1", [1, 1, 1, 1])
+        assert_one(session, "SELECT * FROM mv2", [1, 1])
+        assert_one(session, "SELECT * FROM mv3", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv4", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv5", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv6", [1, 1, 1])
+        assert_one(session, "SELECT * FROM t", [1, 1, 1, 1])
+
+        # mv2, mv5 failed
+        session.execute(SimpleStatement("UPDATE t using timestamp 3 set d = 0 WHERE a = 1"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT * FROM mv1", [1, 1, 1, 0])
+        assert_none(session, "SELECT * FROM mv2")
+        assert_one(session, "SELECT * FROM mv3", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv4", [1, 1, 1])
+        assert_none(session, "SELECT * FROM mv5")
+        assert_one(session, "SELECT * FROM mv6", [1, 0, 1])
+        assert_one(session, "SELECT * FROM t", [1, 1, 1, 0])
+
+        #  mv6 matched
+        session.execute(SimpleStatement("UPDATE t using timestamp 4 set c = 0 WHERE a = 1"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_none(session, "SELECT * FROM mv1")
+        assert_none(session, "SELECT * FROM mv2")
+        assert_none(session, "SELECT * FROM mv3")
+        assert_none(session, "SELECT * FROM mv4")
+        assert_none(session, "SELECT * FROM mv5")
+        assert_one(session, "SELECT * FROM mv6", [1, 0, 0])
+        assert_one(session, "SELECT * FROM t", [1, 1, 0, 0])
+
+        # mv2, mv5 failed
+        session.execute(SimpleStatement("UPDATE t using timestamp 5 set c = 1 WHERE a = 1"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT * FROM mv1", [1, 1, 1, 0])
+        assert_none(session, "SELECT * FROM mv2")
+        assert_one(session, "SELECT * FROM mv3", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv4", [1, 1, 1])
+        assert_none(session, "SELECT * FROM mv5")
+        assert_one(session, "SELECT * FROM mv6", [1, 0, 1])
+        assert_one(session, "SELECT * FROM t", [1, 1, 1, 0])
+
+        # mv6 alive
+        session.execute(SimpleStatement("DELETE b,c FROM t using timestamp 5 WHERE a = 1"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_none(session, "SELECT * FROM mv1")
+        assert_none(session, "SELECT * FROM mv2")
+        assert_none(session, "SELECT * FROM mv3")
+        assert_none(session, "SELECT * FROM mv4")
+        assert_none(session, "SELECT * FROM mv5")
+        assert_one(session, "SELECT * FROM mv6", [1, 0, None])
+        assert_one(session, "SELECT * FROM t", [1, None, None, 0])
+
+        # all dead
+        session.execute(SimpleStatement("DELETE FROM t using timestamp 6 WHERE a = 1"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_none(session, "SELECT * FROM mv1")
+        assert_none(session, "SELECT * FROM mv2")
+        assert_none(session, "SELECT * FROM mv3")
+        assert_none(session, "SELECT * FROM mv4")
+        assert_none(session, "SELECT * FROM mv5")
+        assert_none(session, "SELECT * FROM mv6")
+        assert_none(session, "SELECT * FROM t")
+
+        # mv2, mv5, mv6 failed
+        session.execute(SimpleStatement("UPDATE t using timestamp 7 set b = 1, c = 1 where a = 1"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT * FROM mv1", [1, 1, 1, None])
+        assert_none(session, "SELECT * FROM mv2")
+        assert_one(session, "SELECT * FROM mv3", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv4", [1, 1, 1])
+        assert_none(session, "SELECT * FROM mv5")
+        assert_none(session, "SELECT * FROM mv6")
+        assert_one(session, "SELECT * FROM t", [1, 1, 1, None])
+
+        # c=ttl(3)
+        session.execute(SimpleStatement("UPDATE t using ttl 3 set c = 1 WHERE a = 1"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        debug('Wait for TTL(3) to expire')
+        time.sleep(3)
+        assert_none(session, "SELECT * FROM mv1")
+        assert_none(session, "SELECT * FROM mv2")
+        assert_none(session, "SELECT * FROM mv3")
+        assert_none(session, "SELECT * FROM mv4")
+        assert_none(session, "SELECT * FROM mv5")
+        assert_none(session, "SELECT * FROM mv6")
+        assert_one(session, "SELECT * FROM t", [1, 1, None, None])
+
+    @since('4.0')
+    def test_view_liveness_with_columns_not_in_view_with_flush(self):
+        self._test_view_liveness_with_columns_not_in_view(flush=True)
+
+    @since('4.0')
+    def test_view_liveness_with_columns_not_in_view_without_flush(self):
+        self._test_view_liveness_with_columns_not_in_view(flush=False)
+
+    def _test_view_liveness_with_columns_not_in_view(self, flush):
+        """
+        View row is alive as long as the corresponding base row exists, regardless update semantics.
+        @jira_ticket CASSANDRA-13127
+        """
+        session = self.prepare(rf=3, nodes=3, options={'hinted_handoff_enabled': False})
+        node1, node2, node3 = self.cluster.nodelist()
+        session.execute('USE ks')
+        session.execute("CREATE TABLE t (a int, b int, c int, PRIMARY KEY(a, b))")
+        session.execute(("CREATE MATERIALIZED VIEW mv AS SELECT a, b FROM t "
+                         "WHERE a IS NOT NULL AND b IS NOT NULL PRIMARY KEY (b, a)"))
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        # Set initial values TTL = 3
+        session.execute("INSERT INTO t (a, b) VALUES (0, 0) USING TTL 3")
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+
+        # update normal column with greater TTL
+        # it should generate view updates to keep view alive
+        session.execute("UPDATE t USING TTL 1000 SET c = 0 WHERE a = 0 and b = 0;")
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        debug('Wait for TTL(3) to expire')
+        time.sleep(3)
+        assert_one(session, "SELECT * FROM t", [0, 0, 0])
+        assert_one(session, "SELECT * FROM mv", [0, 0])
+
+        # reset ttl to 3, after 3 second, view row should be gone
+        session.execute("UPDATE t USING TTL 3 SET c = 1 WHERE a = 0 and b = 0;")
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        debug('Wait for TTL(3) to expire')
+        time.sleep(3)
+        assert_none(session, "SELECT a,b,c,ttl(c) FROM t")
+        assert_none(session, "SELECT * FROM mv")
+
+        # update c = 0, view row should be alive
+        session.execute("UPDATE t SET c = 0 WHERE a = 0 and b = 0;")
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT * FROM t", [0, 0, 0])
+        assert_one(session, "SELECT * FROM mv", [0, 0])
+
+        # delete c, view row should be dead
+        session.execute("DELETE c FROM t WHERE a = 0 and b = 0;")
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+            self.cluster.compact()
+        assert_none(session, "SELECT * FROM t")
+        assert_none(session, "SELECT * FROM mv")
+
+    @since('4.0')
+    def test_view_liveness_with_complex_columns_not_in_view_with_flush(self):
+        self._test_view_liveness_with_complex_columns_not_in_view(flush=True)
+
+    @since('4.0')
+    def test_view_liveness_with_complex_columns_not_in_view_without_flush(self):
+        self._test_view_liveness_with_complex_columns_not_in_view(flush=False)
+
+    def _test_view_liveness_with_complex_columns_not_in_view(self, flush):
+        """
+        View row is alive as long as the corresponding base row exists, regardless update semantics.
+        @jira_ticket CASSANDRA-13127
+        """
+        session = self.prepare(rf=3, nodes=3, options={'hinted_handoff_enabled': False})
+        node1, node2, node3 = self.cluster.nodelist()
+        session.execute('USE ks')
+        session.execute("CREATE TABLE t (a int, b int, l list<int>, s set<int>, m map<int,int>, PRIMARY KEY(a, b))")
+        session.execute(("CREATE MATERIALIZED VIEW mv AS SELECT a, b FROM t "
+                         "WHERE a IS NOT NULL AND b IS NOT NULL PRIMARY KEY (b, a)"))
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        # it should generate view updates to keep view alive
+        session.execute("UPDATE t SET l = l + [0] WHERE a = 0 and b = 0;")
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT * FROM t", [0, 0, [0], None, None])
+        assert_one(session, "SELECT * FROM mv", [0, 0])
+
+        # remove the element, view row should be gone
+        session.execute("UPDATE t SET l = l - [0] WHERE a = 0 and b = 0;")
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_none(session, "SELECT * FROM t")
+        assert_none(session, "SELECT * FROM mv")
+
+        # update set and map, view row should be alive
+        session.execute("UPDATE t SET s = s + {0}, m = m + {0:0} WHERE a = 0 and b = 0;")
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT a, b, l, s, m FROM t", [0, 0, None, {0}, {0: 0}])
+        assert_one(session, "SELECT * FROM mv", [0, 0])
+
+        # delete set, view row should be alive because of map
+        session.execute("DELETE s FROM t WHERE a = 0 and b = 0;")
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+            self.cluster.compact()
+        assert_one(session, "SELECT a, b, l, s, m FROM t", [0, 0, None, None, {0: 0}])
+        assert_one(session, "SELECT * FROM mv", [0, 0])
+
     def view_tombstone_test(self):
         """
         Test that a materialized views properly tombstone
