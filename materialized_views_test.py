@@ -41,6 +41,10 @@ class TestMaterializedViews(Tester):
     @since 3.0
     """
 
+    def _rows_to_list(self, rows):
+        new_list = [list(row) for row in rows]
+        return new_list
+
     def prepare(self, user_table=False, rf=1, options=None, nodes=3, install_byteman=False, **kwargs):
         cluster = self.cluster
         cluster.populate([nodes, 0], install_byteman=install_byteman)
@@ -1078,7 +1082,13 @@ class TestMaterializedViews(Tester):
             if expect_digest:
                 self.fail("Didn't find digest mismatch")
 
-    def simple_repair_test(self):
+    def simple_repair_test_by_base(self):
+        self._simple_repair_test(repair_base=True)
+    
+    def simple_repair_test_by_view(self):
+        self._simple_repair_test(repair_view=True)
+    
+    def _simple_repair_test(self, repair_base=False, repair_view=False):
         """
         Test that a materialized view are consistent after a simple repair.
         """
@@ -1122,16 +1132,20 @@ class TestMaterializedViews(Tester):
 
         debug('Start node2, and repair')
         node2.start(wait_other_notice=True, wait_for_binary_proto=True)
-        node1.repair()
+        if repair_base:
+            node1.nodetool("repair ks t")
+        if repair_view:
+            node1.nodetool("repair ks t_by_v")
 
-        debug('Verify the data in the MV with CL=ONE. All should be available now.')
+        debug('Verify the data in the MV with CL=ALL. All should be available now and no digest mismatch')
         for i in xrange(1000):
-            assert_one(
-                session,
+            query = SimpleStatement(
                 "SELECT * FROM t_by_v WHERE v = {}".format(i),
-                [i, i, 'a', 3.0],
-                cl=ConsistencyLevel.ONE
+                consistency_level=ConsistencyLevel.ALL
             )
+            result = session.execute(query, trace=True)
+            self.check_trace_events(result.get_query_trace(), False)
+            self.assertEquals(self._rows_to_list(result.current_rows), [[i, i, 'a', 3.0]])
 
     def base_replica_repair_test(self):
         self._base_replica_repair_test()
